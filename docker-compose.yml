@@ -1,0 +1,17 @@
+services:
+  pulseboard:
+    build: .
+    ports:
+      - "5060:5060"
+    environment:
+      PORT: "5060"
+      HOST: "0.0.0.0"
+      # PUBLIC_BASE_URL: "https://status.example.com"
+      # ALERT_WEBHOOK: "https://hooks.example.com/pulseboard"
+      # CORS_ORIGIN: "https://status.example.com"
+    volumes:
+      - pulseboard-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  pulseboard-data:
