@@ -9,10 +9,15 @@ import {
   loadStore,
   saveStore,
   getMonitor,
+  getProfile,
+  getActiveProfile,
   isValidMonitorId,
   withStoreLock,
   monitorPublicView,
   statusPublicView,
+  listProfilesPublic,
+  createProfile,
+  normalizeProfileName,
 } from "./store.js";
 import { startChecker } from "./checker.js";
 import { loadEnvFile } from "./env.js";
@@ -26,6 +31,11 @@ const CORS_ORIGIN = process.env.CORS_ORIGIN || "";
 const ALERT_WEBHOOK = (process.env.ALERT_WEBHOOK || "").trim();
 
 await ensureDirs();
+await withStoreLock(async () => {
+  // Force migrate legacy store on boot
+  const data = await loadStore();
+  await saveStore(data);
+});
 
 const app = express();
 app.disable("x-powered-by");
@@ -72,6 +82,7 @@ function createRateLimiter({ windowMs, max }) {
 }
 
 const createLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 40 });
+const profileLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 30 });
 
 function clientIp(req) {
   const xf = req.headers["x-forwarded-for"];
@@ -147,10 +158,123 @@ app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
     service: "pulseboard",
-    version: "1.0.0",
+    version: "1.1.0",
     alertWebhook: Boolean(ALERT_WEBHOOK),
     publicBaseUrl: PUBLIC_BASE_URL || null,
   });
+});
+
+app.get("/api/profiles", async (_req, res) => {
+  try {
+    const data = await loadStore();
+    res.json(listProfilesPublic(data));
+  } catch (err) {
+    console.error("[Pulseboard] list profiles failed:", err);
+    clientError(res, 500, "Failed to list profiles");
+  }
+});
+
+app.post("/api/profiles", async (req, res) => {
+  const ip = clientIp(req);
+  if (!profileLimiter(`profile-create:${ip}`)) {
+    return clientError(res, 429, "Too many profile creates. Try again later.");
+  }
+  try {
+    const name = normalizeProfileName(req.body?.name);
+    if (!name) return clientError(res, 400, "Profile name is required");
+
+    const created = await withStoreLock(async () => {
+      const data = await loadStore();
+      const id = createProfile(data, name);
+      await saveStore(data);
+      return { id, name, monitorCount: 0, createdAt: data.profiles[id].createdAt };
+    });
+
+    res.status(201).json(created);
+  } catch (err) {
+    console.error("[Pulseboard] create profile failed:", err);
+    clientError(res, 500, "Failed to create profile");
+  }
+});
+
+app.patch("/api/profiles/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+    if (!isValidMonitorId(id)) return clientError(res, 404, "Profile not found");
+    const name = normalizeProfileName(req.body?.name);
+    if (!name) return clientError(res, 400, "Profile name is required");
+
+    const updated = await withStoreLock(async () => {
+      const data = await loadStore();
+      const profile = getProfile(data, id);
+      if (!profile) return null;
+      profile.name = name;
+      await saveStore(data);
+      return {
+        id,
+        name: profile.name,
+        monitorCount: Object.keys(profile.monitors).length,
+        createdAt: profile.createdAt,
+      };
+    });
+
+    if (!updated) return clientError(res, 404, "Profile not found");
+    res.json(updated);
+  } catch (err) {
+    console.error("[Pulseboard] rename profile failed:", err);
+    clientError(res, 500, "Failed to rename profile");
+  }
+});
+
+app.delete("/api/profiles/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+    if (!isValidMonitorId(id)) return clientError(res, 404, "Profile not found");
+
+    const result = await withStoreLock(async () => {
+      const data = await loadStore();
+      if (!getProfile(data, id)) return { error: "not_found" };
+      const ids = Object.keys(data.profiles);
+      if (ids.length <= 1) return { error: "last" };
+
+      delete data.profiles[id];
+      if (data.activeProfileId === id) {
+        data.activeProfileId = Object.keys(data.profiles)[0];
+      }
+      await saveStore(data);
+      return { ok: true, activeProfileId: data.activeProfileId };
+    });
+
+    if (result.error === "not_found") return clientError(res, 404, "Profile not found");
+    if (result.error === "last") {
+      return clientError(res, 400, "Cannot delete the last profile");
+    }
+    res.json(result);
+  } catch (err) {
+    console.error("[Pulseboard] delete profile failed:", err);
+    clientError(res, 500, "Failed to delete profile");
+  }
+});
+
+app.post("/api/profiles/:id/activate", async (req, res) => {
+  try {
+    const id = req.params.id;
+    if (!isValidMonitorId(id)) return clientError(res, 404, "Profile not found");
+
+    const result = await withStoreLock(async () => {
+      const data = await loadStore();
+      if (!getProfile(data, id)) return null;
+      data.activeProfileId = id;
+      await saveStore(data);
+      return listProfilesPublic(data);
+    });
+
+    if (!result) return clientError(res, 404, "Profile not found");
+    res.json(result);
+  } catch (err) {
+    console.error("[Pulseboard] activate profile failed:", err);
+    clientError(res, 500, "Failed to activate profile");
+  }
 });
 
 app.get("/api/status", async (_req, res) => {
@@ -166,10 +290,16 @@ app.get("/api/status", async (_req, res) => {
 app.get("/api/monitors", async (_req, res) => {
   try {
     const data = await loadStore();
-    const list = Object.entries(data.monitors)
+    const active = getActiveProfile(data);
+    const monitorsMap = active?.profile?.monitors || {};
+    const list = Object.entries(monitorsMap)
       .map(([id, mon]) => monitorPublicView(id, mon))
       .sort((a, b) => a.name.localeCompare(b.name));
-    res.json({ monitors: list });
+    res.json({
+      monitors: list,
+      activeProfileId: active?.id || null,
+      profileName: active?.profile?.name || null,
+    });
   } catch (err) {
     console.error("[Pulseboard] list monitors failed:", err);
     clientError(res, 500, "Failed to list monitors");
@@ -203,16 +333,57 @@ app.post("/api/monitors", async (req, res) => {
       openIncident: null,
     };
 
-    await withStoreLock(async () => {
+    const ok = await withStoreLock(async () => {
       const data = await loadStore();
-      data.monitors[id] = monitor;
+      const active = getActiveProfile(data);
+      if (!active) return false;
+      active.profile.monitors[id] = monitor;
       await saveStore(data);
+      return true;
     });
 
+    if (!ok) return clientError(res, 500, "No active profile");
     res.status(201).json(monitorPublicView(id, monitor));
   } catch (err) {
     console.error("[Pulseboard] create monitor failed:", err);
     clientError(res, 500, "Failed to create monitor");
+  }
+});
+
+app.patch("/api/monitors/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+    if (!isValidMonitorId(id)) return clientError(res, 404, "Monitor not found");
+
+    const parsed = parseMonitorBody(req.body);
+    if (parsed.error) return clientError(res, 400, parsed.error);
+
+    const updated = await withStoreLock(async () => {
+      const data = await loadStore();
+      const mon = getMonitor(data, id);
+      if (!mon) return null;
+      const urlChanged = mon.url !== parsed.url;
+      const expectedChanged = mon.expectedStatus !== parsed.expectedStatus;
+      mon.name = parsed.name;
+      mon.url = parsed.url;
+      mon.intervalSec = parsed.intervalSec;
+      mon.timeoutMs = parsed.timeoutMs;
+      mon.expectedStatus = parsed.expectedStatus;
+      if (urlChanged || expectedChanged) {
+        mon.lastCheckAt = null;
+        mon.lastOk = null;
+        mon.lastLatencyMs = null;
+        mon.lastError = null;
+      }
+      await saveStore(data);
+      return monitorPublicView(id, mon);
+    });
+
+    if (!updated) return clientError(res, 404, "Monitor not found");
+    res.json(updated);
+  } catch (err) {
+    console.error("[Pulseboard] update monitor failed:", err);
+    clientError(res, 500, "Failed to update monitor");
   }
 });
 
@@ -223,11 +394,13 @@ app.delete("/api/monitors/:id", async (req, res) => {
 
     const removed = await withStoreLock(async () => {
       const data = await loadStore();
-      const mon = getMonitor(data, id);
+      const active = getActiveProfile(data);
+      if (!active) return false;
+      const mon = active.profile.monitors[id];
       if (!mon) return false;
-      delete data.monitors[id];
-      for (const [incId, inc] of Object.entries(data.incidents)) {
-        if (inc.monitorId === id) delete data.incidents[incId];
+      delete active.profile.monitors[id];
+      for (const [incId, inc] of Object.entries(active.profile.incidents)) {
+        if (inc.monitorId === id) delete active.profile.incidents[incId];
       }
       await saveStore(data);
       return true;

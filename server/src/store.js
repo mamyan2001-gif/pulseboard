@@ -1,6 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
+import { nanoid } from "nanoid";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = path.resolve(__dirname, "../..");
@@ -9,6 +10,7 @@ export const META_FILE = path.join(DATA_DIR, "pulseboard.json");
 
 const MONITOR_ID_RE = /^[A-Za-z0-9_-]{8,32}$/;
 const HISTORY_LIMIT = 100;
+const PROFILE_NAME_MAX = 80;
 
 let writeChain = Promise.resolve();
 
@@ -26,16 +28,37 @@ export function isValidMonitorId(id) {
   return typeof id === "string" && MONITOR_ID_RE.test(id);
 }
 
+export function normalizeProfileName(raw) {
+  const name = typeof raw === "string" ? raw.trim().slice(0, PROFILE_NAME_MAX) : "";
+  return name || null;
+}
+
+function emptyMonitors() {
+  return Object.create(null);
+}
+
+function emptyIncidents() {
+  return Object.create(null);
+}
+
+function makeEmptyStore() {
+  const id = nanoid(12);
+  const profiles = Object.create(null);
+  profiles[id] = {
+    name: "Main",
+    createdAt: new Date().toISOString(),
+    monitors: emptyMonitors(),
+    incidents: emptyIncidents(),
+  };
+  return { activeProfileId: id, profiles };
+}
+
 export async function ensureDirs() {
   await fs.mkdir(DATA_DIR, { recursive: true });
   try {
     await fs.access(META_FILE);
   } catch {
-    await fs.writeFile(
-      META_FILE,
-      JSON.stringify({ monitors: {}, incidents: {} }, null, 2),
-      "utf8",
-    );
+    await fs.writeFile(META_FILE, JSON.stringify(makeEmptyStore(), null, 2), "utf8");
   }
 }
 
@@ -90,7 +113,7 @@ function normalizeMonitor(raw) {
 }
 
 function normalizeMonitors(raw) {
-  const monitors = Object.create(null);
+  const monitors = emptyMonitors();
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return monitors;
   for (const [id, mon] of Object.entries(raw)) {
     if (!isValidMonitorId(id)) continue;
@@ -101,7 +124,7 @@ function normalizeMonitors(raw) {
 }
 
 function normalizeIncidents(raw) {
-  const incidents = Object.create(null);
+  const incidents = emptyIncidents();
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return incidents;
   for (const [id, inc] of Object.entries(raw)) {
     if (!isValidMonitorId(id) || !inc || typeof inc !== "object") continue;
@@ -118,41 +141,152 @@ function normalizeIncidents(raw) {
   return incidents;
 }
 
+function normalizeProfile(raw, fallbackName = "Profile") {
+  if (!raw || typeof raw !== "object") return null;
+  const name = normalizeProfileName(raw.name) || fallbackName;
+  return {
+    name,
+    createdAt: typeof raw.createdAt === "string" ? raw.createdAt : new Date().toISOString(),
+    monitors: normalizeMonitors(raw.monitors),
+    incidents: normalizeIncidents(raw.incidents),
+  };
+}
+
+/** Convert legacy top-level monitors/incidents into profiles shape. */
+function normalizeStore(raw) {
+  if (!raw || typeof raw !== "object") {
+    return { store: makeEmptyStore(), didMigrate: true };
+  }
+
+  const hasProfiles =
+    raw.profiles && typeof raw.profiles === "object" && !Array.isArray(raw.profiles);
+
+  if (hasProfiles) {
+    const profiles = Object.create(null);
+    for (const [id, profile] of Object.entries(raw.profiles)) {
+      if (!isValidMonitorId(id)) continue;
+      const normalized = normalizeProfile(profile, "Profile");
+      if (normalized) profiles[id] = normalized;
+    }
+    if (Object.keys(profiles).length === 0) {
+      return { store: makeEmptyStore(), didMigrate: true };
+    }
+    const activeProfileId =
+      typeof raw.activeProfileId === "string" && profiles[raw.activeProfileId]
+        ? raw.activeProfileId
+        : Object.keys(profiles)[0];
+    return {
+      store: { activeProfileId, profiles },
+      didMigrate: false,
+    };
+  }
+
+  // Legacy: top-level monitors / incidents
+  const id = nanoid(12);
+  const profiles = Object.create(null);
+  profiles[id] = {
+    name: "Main",
+    createdAt: new Date().toISOString(),
+    monitors: normalizeMonitors(raw.monitors),
+    incidents: normalizeIncidents(raw.incidents),
+  };
+  return {
+    store: { activeProfileId: id, profiles },
+    didMigrate: true,
+  };
+}
+
+async function writeAtomic(store) {
+  await ensureDirs();
+  const { store: normalized } = normalizeStore({
+    activeProfileId: store.activeProfileId,
+    profiles: store.profiles,
+  });
+  const tmp = `${META_FILE}.${process.pid}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(normalized, null, 2), "utf8");
+  await fs.rename(tmp, META_FILE);
+}
+
 export async function loadStore() {
   await ensureDirs();
   let raw;
   try {
     raw = await fs.readFile(META_FILE, "utf8");
   } catch {
-    return { monitors: Object.create(null), incidents: Object.create(null) };
+    const store = makeEmptyStore();
+    await writeAtomic(store);
+    return store;
   }
   try {
     const data = JSON.parse(raw);
-    return {
-      monitors: normalizeMonitors(data?.monitors),
-      incidents: normalizeIncidents(data?.incidents),
-    };
+    const { store, didMigrate } = normalizeStore(data);
+    if (didMigrate) {
+      await writeAtomic(store);
+    }
+    return store;
   } catch (err) {
     console.error("[Pulseboard] corrupt pulseboard.json, starting empty:", err.message);
-    return { monitors: Object.create(null), incidents: Object.create(null) };
+    const store = makeEmptyStore();
+    await writeAtomic(store);
+    return store;
   }
 }
 
 export async function saveStore(data) {
-  await ensureDirs();
-  const payload = {
-    monitors: normalizeMonitors(data?.monitors),
-    incidents: normalizeIncidents(data?.incidents),
-  };
-  const tmp = `${META_FILE}.${process.pid}.tmp`;
-  await fs.writeFile(tmp, JSON.stringify(payload, null, 2), "utf8");
-  await fs.rename(tmp, META_FILE);
+  const { store } = normalizeStore(data);
+  await writeAtomic(store);
+}
+
+export function getActiveProfile(data) {
+  if (!data?.profiles) return null;
+  const id = data.activeProfileId;
+  if (id && Object.prototype.hasOwnProperty.call(data.profiles, id)) {
+    return { id, profile: data.profiles[id] };
+  }
+  const firstId = Object.keys(data.profiles)[0];
+  if (!firstId) return null;
+  return { id: firstId, profile: data.profiles[firstId] };
+}
+
+export function getProfile(data, id) {
+  if (!isValidMonitorId(id)) return null;
+  if (!data?.profiles || !Object.prototype.hasOwnProperty.call(data.profiles, id)) {
+    return null;
+  }
+  return data.profiles[id];
 }
 
 export function getMonitor(data, id) {
-  if (!isValidMonitorId(id)) return null;
-  if (!Object.prototype.hasOwnProperty.call(data.monitors, id)) return null;
-  return data.monitors[id];
+  const active = getActiveProfile(data);
+  if (!active || !isValidMonitorId(id)) return null;
+  if (!Object.prototype.hasOwnProperty.call(active.profile.monitors, id)) return null;
+  return active.profile.monitors[id];
+}
+
+export function listProfilesPublic(data) {
+  const profiles = Object.entries(data.profiles || {})
+    .map(([id, p]) => ({
+      id,
+      name: p.name,
+      monitorCount: Object.keys(p.monitors || {}).length,
+      createdAt: p.createdAt,
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  return {
+    activeProfileId: data.activeProfileId,
+    profiles,
+  };
+}
+
+export function createProfile(data, name) {
+  const id = nanoid(12);
+  data.profiles[id] = {
+    name,
+    createdAt: new Date().toISOString(),
+    monitors: emptyMonitors(),
+    incidents: emptyIncidents(),
+  };
+  return id;
 }
 
 export function computeUptimeStats(history) {
@@ -238,11 +372,13 @@ export function monitorPublicView(id, mon) {
 }
 
 export function statusPublicView(data) {
+  const active = getActiveProfile(data);
+  const monitorsMap = active?.profile?.monitors || emptyMonitors();
   const monitors = [];
   let down = 0;
   let sampleSum = 0;
   let upSum = 0;
-  for (const [id, mon] of Object.entries(data.monitors)) {
+  for (const [id, mon] of Object.entries(monitorsMap)) {
     if (mon.lastOk === false) down += 1;
     const stats = computeUptimeStats(mon.history);
     sampleSum += stats.samples;
@@ -279,6 +415,8 @@ export function statusPublicView(data) {
   return {
     overall,
     checkedAt: new Date().toISOString(),
+    activeProfileId: active?.id || null,
+    profileName: active?.profile?.name || null,
     total: monitors.length,
     down,
     up,
@@ -293,4 +431,4 @@ export function statusPublicView(data) {
   };
 }
 
-export { HISTORY_LIMIT };
+export { HISTORY_LIMIT, PROFILE_NAME_MAX };

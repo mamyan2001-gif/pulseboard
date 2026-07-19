@@ -42,13 +42,15 @@ docker compose up --build
 
 ## What you can do
 
-- Add monitors by URL (scheme optional — `https://` is filled in)
+- **Profiles** — named workspaces of monitors (create, rename, switch, delete)
+- Add and **edit** monitors (name, URL, interval, timeout, expected status)
+- Scheme optional on URLs — `https://` is filled in
 - Click a URL to copy it
 - See live Up / Down / Pending status and latency
-- Open **Statistics** for overall uptime and a per-site table
+- Open **Statistics** for the active profile’s uptime table
 - Optional down/up alert webhook
 
-First visit with an empty list? Use **Add example.com** to create a sample monitor.
+First visit with an empty list? Use **Add example.com** to create a sample monitor. Existing data is migrated into a **Main** profile automatically.
 
 ## Configuration (optional)
 
@@ -83,12 +85,18 @@ HOST=0.0.0.0 PORT=5060 PUBLIC_BASE_URL=https://status.example.com npm start -- -
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/health` | Health check |
-| GET | `/api/status` | Overall status + monitors (JSON) |
-| GET | `/api/monitors` | List monitors |
+| GET | `/api/profiles` | List profiles + `activeProfileId` |
+| POST | `/api/profiles` | Create profile (`name`) |
+| PATCH | `/api/profiles/:id` | Rename profile (`name`) |
+| DELETE | `/api/profiles/:id` | Delete profile (not the last one) |
+| POST | `/api/profiles/:id/activate` | Switch active profile |
+| GET | `/api/status` | Overall status + monitors for active profile |
+| GET | `/api/monitors` | List monitors in active profile |
 | POST | `/api/monitors` | Create monitor (`name`, `url`, `intervalSec` 30–3600, `timeoutMs`, `expectedStatus` default 200) |
+| PATCH | `/api/monitors/:id` | Update monitor fields |
 | DELETE | `/api/monitors/:id` | Delete monitor |
 
-URLs without a scheme are stored as `https://…`.
+URLs without a scheme are stored as `https://…`. Only the **active** profile is checked and shown.
 
 ### Alert webhook payload
 

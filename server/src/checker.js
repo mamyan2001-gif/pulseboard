@@ -3,6 +3,7 @@ import {
   loadStore,
   saveStore,
   withStoreLock,
+  getActiveProfile,
   HISTORY_LIMIT,
 } from "./store.js";
 
@@ -46,7 +47,6 @@ async function checkOnce(url, timeoutMs) {
       },
     });
     const latencyMs = Date.now() - started;
-    // Status-only check — drop the body so large pages don't buffer in memory.
     try {
       res.body?.cancel?.();
     } catch {
@@ -73,14 +73,16 @@ function isDue(mon, now) {
 export async function runDueChecks() {
   const now = Date.now();
   const snapshot = await loadStore();
-  const due = Object.entries(snapshot.monitors).filter(([, mon]) => isDue(mon, now));
+  const active = getActiveProfile(snapshot);
+  if (!active) return;
+
+  const profileId = active.id;
+  const due = Object.entries(active.profile.monitors).filter(([, mon]) => isDue(mon, now));
   if (!due.length) return;
 
   for (const [id, mon] of due) {
     const result = await checkOnce(mon.url, mon.timeoutMs);
-    const ok =
-      result.okHttp &&
-      result.statusCode === mon.expectedStatus;
+    const ok = result.okHttp && result.statusCode === mon.expectedStatus;
     const error = ok
       ? null
       : result.error ||
@@ -89,7 +91,9 @@ export async function runDueChecks() {
 
     const alertPayload = await withStoreLock(async () => {
       const data = await loadStore();
-      const current = data.monitors[id];
+      const currentActive = getActiveProfile(data);
+      if (!currentActive || currentActive.id !== profileId) return null;
+      const current = currentActive.profile.monitors[id];
       if (!current) return null;
 
       const entry = {
@@ -111,7 +115,7 @@ export async function runDueChecks() {
           openedAt: checkedAt,
           message: error || "Monitor failed",
         };
-        data.incidents[incidentId] = {
+        currentActive.profile.incidents[incidentId] = {
           id: incidentId,
           monitorId: id,
           openedAt: checkedAt,
@@ -126,9 +130,12 @@ export async function runDueChecks() {
         };
       } else if (ok && openIncident) {
         const closedId = openIncident.id;
-        if (closedId && Object.prototype.hasOwnProperty.call(data.incidents, closedId)) {
-          data.incidents[closedId].closedAt = checkedAt;
-          data.incidents[closedId].status = "closed";
+        if (
+          closedId &&
+          Object.prototype.hasOwnProperty.call(currentActive.profile.incidents, closedId)
+        ) {
+          currentActive.profile.incidents[closedId].closedAt = checkedAt;
+          currentActive.profile.incidents[closedId].status = "closed";
         }
         alert = {
           monitor: { id, name: current.name, url: current.url },
@@ -138,7 +145,7 @@ export async function runDueChecks() {
         openIncident = null;
       }
 
-      data.monitors[id] = {
+      currentActive.profile.monitors[id] = {
         ...current,
         lastCheckAt: checkedAt,
         lastOk: ok,

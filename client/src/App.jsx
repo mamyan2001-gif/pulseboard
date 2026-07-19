@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 async function api(path, options = {}) {
   let res;
@@ -15,15 +15,21 @@ async function api(path, options = {}) {
   try {
     data = text ? JSON.parse(text) : {};
   } catch {
-    if (!res.ok) {
-      throw new Error(
-        res.status === 500 || /internal server error/i.test(text)
-          ? "Cannot reach Pulseboard API (is it running on :5060?)"
-          : text.slice(0, 120) || res.statusText,
-      );
-    }
+    data = {};
   }
-  if (!res.ok) throw new Error(data.error || res.statusText);
+  if (!res.ok) {
+    const msg = data.error || text.slice(0, 120) || res.statusText || "Request failed";
+    const apiDown =
+      res.status === 502 ||
+      res.status === 503 ||
+      res.status === 504 ||
+      res.status === 500 ||
+      /internal server error/i.test(msg) ||
+      /ECONNREFUSED|proxy error/i.test(msg);
+    throw new Error(
+      apiDown ? "Cannot reach Pulseboard API (is it running on :5060?)" : msg,
+    );
+  }
   return data;
 }
 
@@ -95,6 +101,21 @@ function formatUptime(pct) {
   return `${pct.toFixed(pct % 1 === 0 ? 0 : 2)}%`;
 }
 
+/** Compact display for large totals so overview tiles don’t overflow. */
+function formatCount(n) {
+  if (n == null || !Number.isFinite(n)) return "—";
+  const abs = Math.abs(n);
+  if (abs >= 1_000_000) {
+    const v = Math.round(n / 100_000) / 10;
+    return `${String(v).replace(/\.0$/, "")}M`;
+  }
+  if (abs >= 10_000) {
+    const v = Math.round(n / 100) / 10;
+    return `${String(v).replace(/\.0$/, "")}k`;
+  }
+  return String(n);
+}
+
 /** Prepend https:// when the user omits a scheme. */
 function normalizeMonitorUrl(raw) {
   const trimmed = String(raw || "").trim();
@@ -102,6 +123,24 @@ function normalizeMonitorUrl(raw) {
   if (/^https?:\/\//i.test(trimmed)) return trimmed;
   if (trimmed.startsWith("//")) return `https:${trimmed}`;
   return `https://${trimmed}`;
+}
+
+const emptyMonitorForm = () => ({
+  name: "",
+  url: "",
+  intervalSec: "60",
+  timeoutMs: "5000",
+  expectedStatus: "200",
+});
+
+function monitorToForm(m) {
+  return {
+    name: m.name || "",
+    url: m.url || "",
+    intervalSec: String(m.intervalSec ?? 60),
+    timeoutMs: String(m.timeoutMs ?? 5000),
+    expectedStatus: String(m.expectedStatus ?? 200),
+  };
 }
 
 function CopyableUrl({ url, className = "monitor-row__url" }) {
@@ -139,6 +178,74 @@ function CopyableUrl({ url, className = "monitor-row__url" }) {
   );
 }
 
+function MonitorFields({ idPrefix, form, onChange, onUrlBlur }) {
+  return (
+    <div className="controls">
+      <div className="field field--wide">
+        <label htmlFor={`${idPrefix}-name`}>Name</label>
+        <input
+          id={`${idPrefix}-name`}
+          required
+          maxLength={120}
+          value={form.name}
+          onChange={(e) => onChange("name", e.target.value)}
+          placeholder="API"
+        />
+      </div>
+      <div className="field field--wide">
+        <label htmlFor={`${idPrefix}-url`}>URL</label>
+        <input
+          id={`${idPrefix}-url`}
+          type="text"
+          inputMode="url"
+          autoComplete="url"
+          required
+          value={form.url}
+          onChange={(e) => onChange("url", e.target.value)}
+          onBlur={onUrlBlur}
+          placeholder="example.com or https://example.com/health"
+        />
+      </div>
+      <div className="field">
+        <label htmlFor={`${idPrefix}-interval`}>Interval (sec)</label>
+        <input
+          id={`${idPrefix}-interval`}
+          type="number"
+          min={30}
+          max={3600}
+          required
+          value={form.intervalSec}
+          onChange={(e) => onChange("intervalSec", e.target.value)}
+        />
+      </div>
+      <div className="field">
+        <label htmlFor={`${idPrefix}-timeout`}>Timeout (ms)</label>
+        <input
+          id={`${idPrefix}-timeout`}
+          type="number"
+          min={500}
+          max={60000}
+          required
+          value={form.timeoutMs}
+          onChange={(e) => onChange("timeoutMs", e.target.value)}
+        />
+      </div>
+      <div className="field">
+        <label htmlFor={`${idPrefix}-expected`}>Expected status</label>
+        <input
+          id={`${idPrefix}-expected`}
+          type="number"
+          min={100}
+          max={599}
+          required
+          value={form.expectedStatus}
+          onChange={(e) => onChange("expectedStatus", e.target.value)}
+        />
+      </div>
+    </div>
+  );
+}
+
 function routeName() {
   const path = window.location.pathname.replace(/\/+$/, "") || "/";
   if (path === "/stats" || path.startsWith("/stats/") || path === "/status" || path.startsWith("/status/")) {
@@ -147,8 +254,195 @@ function routeName() {
   return "admin";
 }
 
+function ProfileBar({ profiles, activeProfileId, onChanged, onError }) {
+  const [busy, setBusy] = useState(false);
+  const [mode, setMode] = useState(null); // null | "rename" | "create"
+  const [draftName, setDraftName] = useState("");
+  const inputRef = useRef(null);
+
+  const active = profiles.find((p) => p.id === activeProfileId) || null;
+  const activeName = active?.name || "";
+
+  useEffect(() => {
+    if (mode && inputRef.current) {
+      inputRef.current.focus();
+      inputRef.current.select();
+    }
+  }, [mode]);
+
+  function cancelMode() {
+    setMode(null);
+    setDraftName("");
+  }
+
+  async function activate(id) {
+    if (!id || id === activeProfileId) return;
+    cancelMode();
+    setBusy(true);
+    onError("");
+    try {
+      await api(`/api/profiles/${id}/activate`, { method: "POST" });
+      await onChanged();
+    } catch (err) {
+      onError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function startCreate() {
+    setMode("create");
+    setDraftName("");
+    onError("");
+  }
+
+  function startRename() {
+    if (!activeProfileId) return;
+    setMode("rename");
+    setDraftName(activeName);
+    onError("");
+  }
+
+  async function submitName(e) {
+    e.preventDefault();
+    const trimmed = draftName.trim();
+    if (!trimmed) {
+      onError("Profile name is required");
+      return;
+    }
+    if (mode === "rename" && trimmed === activeName) {
+      cancelMode();
+      return;
+    }
+
+    setBusy(true);
+    onError("");
+    try {
+      if (mode === "create") {
+        const created = await api("/api/profiles", {
+          method: "POST",
+          body: JSON.stringify({ name: trimmed }),
+        });
+        await api(`/api/profiles/${created.id}/activate`, { method: "POST" });
+      } else if (mode === "rename" && activeProfileId) {
+        await api(`/api/profiles/${activeProfileId}`, {
+          method: "PATCH",
+          body: JSON.stringify({ name: trimmed }),
+        });
+      }
+      cancelMode();
+      await onChanged();
+    } catch (err) {
+      onError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteProfile() {
+    if (!activeProfileId) return;
+    if (profiles.length <= 1) {
+      onError("Cannot delete the last profile");
+      return;
+    }
+    if (!window.confirm(`Delete profile “${activeName || "Untitled"}” and all its monitors?`)) {
+      return;
+    }
+    cancelMode();
+    setBusy(true);
+    onError("");
+    try {
+      await api(`/api/profiles/${activeProfileId}`, { method: "DELETE" });
+      await onChanged();
+    } catch (err) {
+      onError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="profile-panel" aria-label="Profiles">
+      <div className="profile-panel__head">
+        <h2 className="section__title">Profile</h2>
+      </div>
+
+      <div className="profile-panel__row">
+        <label htmlFor="profile-select" className="sr-only">
+          Active profile
+        </label>
+        <select
+          id="profile-select"
+          className="profile-panel__select"
+          value={activeProfileId || ""}
+          disabled={busy || profiles.length === 0 || Boolean(mode)}
+          onChange={(e) => activate(e.target.value)}
+        >
+          {profiles.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name} · {p.monitorCount} monitor{p.monitorCount === 1 ? "" : "s"}
+            </option>
+          ))}
+        </select>
+
+        {!mode && (
+          <div className="profile-panel__actions">
+            <button type="button" className="btn btn-ghost btn-sm" disabled={busy} onClick={startCreate}>
+              New
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm"
+              disabled={busy || !activeProfileId}
+              onClick={startRename}
+            >
+              Rename
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm"
+              disabled={busy || profiles.length <= 1}
+              onClick={deleteProfile}
+            >
+              Delete
+            </button>
+          </div>
+        )}
+      </div>
+
+      {mode && (
+        <form className="profile-panel__form" onSubmit={submitName}>
+          <label htmlFor="profile-name-draft" className="sr-only">
+            {mode === "create" ? "New profile name" : "Rename profile"}
+          </label>
+          <input
+            ref={inputRef}
+            id="profile-name-draft"
+            className="profile-panel__input"
+            maxLength={80}
+            value={draftName}
+            onChange={(e) => setDraftName(e.target.value)}
+            placeholder={mode === "create" ? "Profile name" : "Rename…"}
+            autoComplete="off"
+            disabled={busy}
+          />
+          <div className="profile-panel__actions">
+            <button className="btn btn-primary btn-sm" type="submit" disabled={busy || !draftName.trim()}>
+              {busy ? "Saving…" : mode === "create" ? "Create" : "Save"}
+            </button>
+            <button className="btn btn-ghost btn-sm" type="button" disabled={busy} onClick={cancelMode}>
+              Cancel
+            </button>
+          </div>
+        </form>
+      )}
+    </section>
+  );
+}
+
 function StatisticsPage() {
   const [monitors, setMonitors] = useState([]);
+  const [profileName, setProfileName] = useState("");
   const [query, setQuery] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -157,6 +451,7 @@ function StatisticsPage() {
     try {
       const data = await api("/api/monitors");
       setMonitors(data.monitors || []);
+      setProfileName(data.profileName || "");
       setError("");
     } catch (err) {
       setError(err.message);
@@ -210,7 +505,9 @@ function StatisticsPage() {
     <div className="app app--stats">
       <header className="brand">
         <a className="brand__name" href="/">Pulseboard</a>
-        <p className="brand__tag">Statistics</p>
+        <p className="brand__tag">
+          Statistics{profileName ? ` · ${profileName}` : ""}
+        </p>
         <nav className="nav-links">
           <a href="/">Main</a>
         </nav>
@@ -234,22 +531,21 @@ function StatisticsPage() {
               </div>
               <div className="stats-summary__item">
                 <span className="stats__key">Monitors</span>
-                <span className="stats-summary__val">{monitors.length}</span>
+                <span className="stats-summary__val">{formatCount(monitors.length)}</span>
               </div>
               <div className="stats-summary__item">
                 <span className="stats__key">Checks</span>
-                <span className="stats-summary__val">
-                  {totals.upCount}/{totals.samples}
+                <span className="stats-summary__val" title={`${totals.upCount}/${totals.samples}`}>
+                  {formatCount(totals.upCount)}/{formatCount(totals.samples)}
                 </span>
               </div>
               <div className="stats-summary__item">
                 <span className="stats__key">Failed</span>
-                <span className="stats-summary__val">{totals.downCount}</span>
+                <span className="stats-summary__val" title={String(totals.downCount)}>
+                  {formatCount(totals.downCount)}
+                </span>
               </div>
             </div>
-            <p className="muted stats-summary__note">
-              Based on each monitor’s recent check history (up to 100 samples).
-            </p>
           </section>
 
           <section className="section">
@@ -332,21 +628,24 @@ function StatisticsPage() {
 
 function AdminPage() {
   const [monitors, setMonitors] = useState([]);
+  const [profiles, setProfiles] = useState([]);
+  const [activeProfileId, setActiveProfileId] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [form, setForm] = useState({
-    name: "",
-    url: "",
-    intervalSec: "60",
-    timeoutMs: "5000",
-    expectedStatus: "200",
-  });
+  const [form, setForm] = useState(emptyMonitorForm);
+  const [editingId, setEditingId] = useState(null);
+  const [editForm, setEditForm] = useState(emptyMonitorForm);
 
   const load = useCallback(async () => {
     try {
-      const data = await api("/api/monitors");
-      setMonitors(data.monitors || []);
+      const [monData, profileData] = await Promise.all([
+        api("/api/monitors"),
+        api("/api/profiles"),
+      ]);
+      setMonitors(monData.monitors || []);
+      setActiveProfileId(monData.activeProfileId || profileData.activeProfileId || "");
+      setProfiles(profileData.profiles || []);
       setError("");
     } catch (err) {
       setError(err.message);
@@ -363,6 +662,10 @@ function AdminPage() {
 
   function updateField(key, value) {
     setForm((prev) => ({ ...prev, [key]: value }));
+  }
+
+  function updateEditField(key, value) {
+    setEditForm((prev) => ({ ...prev, [key]: value }));
   }
 
   async function handleCreate(e) {
@@ -382,13 +685,7 @@ function AdminPage() {
           expectedStatus: Number(form.expectedStatus),
         }),
       });
-      setForm({
-        name: "",
-        url: "",
-        intervalSec: "60",
-        timeoutMs: "5000",
-        expectedStatus: "200",
-      });
+      setForm(emptyMonitorForm());
       await load();
     } catch (err) {
       setError(err.message);
@@ -402,9 +699,48 @@ function AdminPage() {
     setError("");
     try {
       await api(`/api/monitors/${id}`, { method: "DELETE" });
+      if (editingId === id) setEditingId(null);
       await load();
     } catch (err) {
       setError(err.message);
+    }
+  }
+
+  function startEdit(m) {
+    setEditingId(m.id);
+    setEditForm(monitorToForm(m));
+    setError("");
+  }
+
+  function cancelEdit() {
+    setEditingId(null);
+    setEditForm(emptyMonitorForm());
+  }
+
+  async function saveEdit(e) {
+    e.preventDefault();
+    if (!editingId) return;
+    setBusy(true);
+    setError("");
+    const url = normalizeMonitorUrl(editForm.url);
+    setEditForm((prev) => ({ ...prev, url }));
+    try {
+      await api(`/api/monitors/${editingId}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          name: editForm.name.trim(),
+          url,
+          intervalSec: Number(editForm.intervalSec),
+          timeoutMs: Number(editForm.timeoutMs),
+          expectedStatus: Number(editForm.expectedStatus),
+        }),
+      });
+      setEditingId(null);
+      await load();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -440,81 +776,27 @@ function AdminPage() {
         </nav>
       </header>
 
+      <ProfileBar
+        profiles={profiles}
+        activeProfileId={activeProfileId}
+        onChanged={load}
+        onError={setError}
+      />
+
       <section className="section">
         <h2 className="section__title">Add monitor</h2>
         <form className="composer" onSubmit={handleCreate}>
-          <div className="controls">
-            <div className="field field--wide">
-              <label htmlFor="name">Name</label>
-              <input
-                id="name"
-                required
-                maxLength={120}
-                value={form.name}
-                onChange={(e) => updateField("name", e.target.value)}
-                placeholder="API"
-              />
-            </div>
-            <div className="field field--wide">
-              <label htmlFor="url">URL</label>
-              <input
-                id="url"
-                type="text"
-                inputMode="url"
-                autoComplete="url"
-                required
-                value={form.url}
-                onChange={(e) => updateField("url", e.target.value)}
-                onBlur={() => updateField("url", normalizeMonitorUrl(form.url))}
-                placeholder="example.com or https://example.com/health"
-              />
-            </div>
-            <div className="field">
-              <label htmlFor="interval">Interval (sec)</label>
-              <input
-                id="interval"
-                type="number"
-                min={30}
-                max={3600}
-                required
-                value={form.intervalSec}
-                onChange={(e) => updateField("intervalSec", e.target.value)}
-              />
-            </div>
-            <div className="field">
-              <label htmlFor="timeout">Timeout (ms)</label>
-              <input
-                id="timeout"
-                type="number"
-                min={500}
-                max={60000}
-                required
-                value={form.timeoutMs}
-                onChange={(e) => updateField("timeoutMs", e.target.value)}
-              />
-            </div>
-            <div className="field">
-              <label htmlFor="expected">Expected status</label>
-              <input
-                id="expected"
-                type="number"
-                min={100}
-                max={599}
-                required
-                value={form.expectedStatus}
-                onChange={(e) => updateField("expectedStatus", e.target.value)}
-              />
-            </div>
-          </div>
+          <MonitorFields
+            idPrefix="add"
+            form={form}
+            onChange={updateField}
+            onUrlBlur={() => updateField("url", normalizeMonitorUrl(form.url))}
+          />
           <div className="actions">
             <button className="btn btn-primary" type="submit" disabled={busy}>
-              {busy ? "Adding…" : "Add monitor"}
+              {busy && !editingId ? "Adding…" : "Add monitor"}
             </button>
           </div>
-          <p className="muted form-tip">
-            Tip: paste <code>mysite.com</code> — <code>https://</code> is added automatically.
-            Use <code>http://</code> when you need plain HTTP.
-          </p>
         </form>
       </section>
 
@@ -548,28 +830,66 @@ function AdminPage() {
         <ul className="monitor-list">
           {monitors.map((m) => {
             const st = statusLabel(m.lastOk);
+            const isEditing = editingId === m.id;
             return (
-              <li key={m.id} className="monitor-row">
-                <SiteIcon url={m.url} name={m.name} />
-                <div className="monitor-row__main">
-                  <strong>{m.name}</strong>
-                  <CopyableUrl url={m.url} />
-                  <span className="monitor-row__sub muted">
-                    every {m.intervalSec}s · last {formatTime(m.lastCheckAt)}
-                    {m.openIncident ? ` · incident: ${m.openIncident.message}` : ""}
-                  </span>
-                </div>
-                <div className="monitor-row__meta">
-                  <span className={st.className}>{st.text}</span>
-                  <span className="muted">{formatLatency(m.lastLatencyMs)}</span>
-                  <button
-                    type="button"
-                    className="btn btn-ghost btn-sm"
-                    onClick={() => handleDelete(m.id)}
-                  >
-                    Delete
-                  </button>
-                </div>
+              <li key={m.id} className={`monitor-row${isEditing ? " monitor-row--editing" : ""}`}>
+                {isEditing ? (
+                  <form className="monitor-edit" onSubmit={saveEdit}>
+                    <MonitorFields
+                      idPrefix={`edit-${m.id}`}
+                      form={editForm}
+                      onChange={updateEditField}
+                      onUrlBlur={() =>
+                        updateEditField("url", normalizeMonitorUrl(editForm.url))
+                      }
+                    />
+                    <div className="actions">
+                      <button className="btn btn-primary" type="submit" disabled={busy}>
+                        {busy ? "Saving…" : "Save"}
+                      </button>
+                      <button
+                        className="btn btn-ghost"
+                        type="button"
+                        disabled={busy}
+                        onClick={cancelEdit}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </form>
+                ) : (
+                  <>
+                    <SiteIcon url={m.url} name={m.name} />
+                    <div className="monitor-row__main">
+                      <strong>{m.name}</strong>
+                      <CopyableUrl url={m.url} />
+                      <span className="monitor-row__sub muted">
+                        every {m.intervalSec}s · last {formatTime(m.lastCheckAt)}
+                        {m.openIncident ? ` · incident: ${m.openIncident.message}` : ""}
+                      </span>
+                    </div>
+                    <div className="monitor-row__meta">
+                      <span className={st.className}>{st.text}</span>
+                      <span className="muted">{formatLatency(m.lastLatencyMs)}</span>
+                      <div className="monitor-row__actions">
+                        <button
+                          type="button"
+                          className="btn btn-ghost btn-sm"
+                          onClick={() => startEdit(m)}
+                        >
+                          Edit
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-ghost btn-sm"
+                          onClick={() => handleDelete(m.id)}
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </div>
+                  </>
+                )}
               </li>
             );
           })}

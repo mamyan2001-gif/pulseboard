@@ -99,7 +99,8 @@ a { color: var(--accent); }
   margin-top: 12px;
   font-size: 1.12rem;
   color: var(--muted);
-  max-width: 28ch;
+  max-width: none;
+  white-space: nowrap;
 }
 
 .status-link {
@@ -115,6 +116,82 @@ a { color: var(--accent); }
 .status-link:hover {
   color: var(--accent-hover);
   border-color: var(--accent-hover);
+}
+
+.profile-panel {
+  margin: 28px 0 0;
+  padding: 20px 0 4px;
+  border-top: 1px solid var(--line);
+}
+
+.profile-panel__head {
+  margin-bottom: 12px;
+}
+
+.profile-panel__head .section__title {
+  margin-bottom: 4px;
+}
+
+.profile-panel__row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 12px;
+}
+
+.profile-panel__select {
+  flex: 1 1 220px;
+  min-width: 180px;
+  height: 40px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.profile-panel__form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 12px;
+  margin-top: 12px;
+}
+
+.profile-panel__input {
+  flex: 1 1 200px;
+  min-width: 160px;
+  height: 40px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.profile-panel__input:focus {
+  outline: 2px solid var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.profile-panel__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.monitor-row--editing {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.monitor-edit {
+  width: 100%;
+}
+
+.monitor-edit .actions {
+  margin-top: 12px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .section {
@@ -292,16 +369,9 @@ a { color: var(--accent); }
   opacity: 0.9;
 }
 
-.alert__hint code,
-.form-tip code {
+.alert__hint code {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.86em;
-}
-
-.form-tip {
-  margin: 12px 0 0;
-  font-size: 0.85rem;
-  line-height: 1.45;
 }
 
 .empty-state {
@@ -475,16 +545,15 @@ button.monitor-row__url.is-copied {
 
 .stats-summary__val {
   font-family: var(--display);
-  font-size: clamp(1.35rem, 3vw, 1.75rem);
+  font-size: clamp(1.05rem, 2.2vw, 1.75rem);
   font-weight: 700;
   letter-spacing: -0.03em;
   font-variant-numeric: tabular-nums;
-  line-height: 1.15;
-}
-
-.stats-summary__note {
-  margin-top: 14px;
-  font-size: 0.85rem;
+  line-height: 1.2;
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 @media (max-width: 720px) {
@@ -567,6 +636,13 @@ button.monitor-row__url.is-copied {
   flex-shrink: 0;
   font-variant-numeric: tabular-nums;
   font-size: 0.88rem;
+}
+
+.monitor-row__actions {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
 }
 
 .pill {
